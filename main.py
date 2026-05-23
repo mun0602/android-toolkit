@@ -1,25 +1,34 @@
 import os
 import sys
+import subprocess
+import ctypes
 import time
 import json
+import winreg
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QLabel, QGroupBox, QLineEdit, QComboBox, 
     QTableWidget, QTableWidgetItem, QProgressBar, QTextEdit, 
-    QCheckBox, QHeaderView, QMessageBox
+    QCheckBox, QHeaderView, QMessageBox, QFrame, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTimer, QSize
-from PyQt6.QtGui import QColor, QPixmap
+from PyQt6.QtGui import QColor, QPixmap, QShortcut, QKeySequence
 
 from style import DARK_STYLE
 from adb_wrapper import ADBWrapper, ADBTaskWorker
 from ui_components import APKDragDropArea, APKListWidget
 
+# Giới hạn số dòng tối đa trong console log để tránh rò rỉ bộ nhớ
+MAX_LOG_LINES = 2000
+# Giới hạn số tiến trình Scrcpy tối đa có thể khởi chạy đồng thời
+MAX_SCRCPY_INSTANCES = 20
+
 class AndroidToolkitApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Android Multi-Device Farm Controller Pro v1.2")
-        self.resize(1150, 780)
+        self.setWindowTitle("Android Multi-Device Farm Controller Pro v1.3")
+        self.resize(1200, 850)
+        self.setMinimumSize(900, 650)
         
         # Khởi tạo ADB Wrapper
         self.adb = ADBWrapper()
@@ -27,6 +36,7 @@ class AndroidToolkitApp(QMainWindow):
         
         self.devices_list = []
         self.active_worker = None
+        self._model_cache = {}  # Cache model info để tránh gọi getprop liên tục
         self.output_dir = os.path.join(os.path.expanduser("~"), "Documents", "AndroidToolkit")
         os.makedirs(self.output_dir, exist_ok=True)
         
@@ -34,10 +44,10 @@ class AndroidToolkitApp(QMainWindow):
         self.init_ui()
         self.setStyleSheet(DARK_STYLE)
         
-        # Bộ đếm thời gian tự động quét thiết bị sau mỗi 3 giây
+        # Bộ đếm thời gian tự động quét thiết bị sau mỗi 5 giây (giảm tải ADB)
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.auto_refresh_device)
-        self.refresh_timer.start(3000)
+        self.refresh_timer.start(5000)
         
         # Quét thiết bị lần đầu
         self.refresh_devices()
@@ -123,6 +133,11 @@ class AndroidToolkitApp(QMainWindow):
         body_layout.addWidget(left_group, 4)
         
         # CỘT PHẢI: Bảng điều khiển tác vụ tối giản (Chiếm 5 phần)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setStyleSheet("QScrollArea { background-color: transparent; border: none; }")
+        
         right_group = QGroupBox("Bảng điều khiển tác vụ đồng loạt (Bulk Dashboard)")
         right_layout = QVBoxLayout(right_group)
         right_layout.setContentsMargins(15, 15, 15, 12)
@@ -160,6 +175,13 @@ class AndroidToolkitApp(QMainWindow):
         self.btn_tile_windows.setFixedWidth(150)
         self.btn_tile_windows.clicked.connect(self.farm_arrange_windows)
         config_layout.addWidget(self.btn_tile_windows)
+        
+        self.btn_close_all_scrcpy = QPushButton("❌ Đóng tất cả")
+        self.btn_close_all_scrcpy.setObjectName("dangerButton")
+        self.btn_close_all_scrcpy.setFixedWidth(120)
+        self.btn_close_all_scrcpy.setToolTip("Đóng tất cả cửa sổ Scrcpy đang mở")
+        self.btn_close_all_scrcpy.clicked.connect(self.farm_close_all_scrcpy)
+        config_layout.addWidget(self.btn_close_all_scrcpy)
         
         scrcpy_layout.addLayout(config_layout)
         
@@ -226,8 +248,83 @@ class AndroidToolkitApp(QMainWindow):
         reboot_layout.addWidget(self.btn_power_off)
         
         right_layout.addWidget(reboot_group)
-        
-        body_layout.addWidget(right_group, 5)
+
+        # 4. Cấu hình Mạng & Hệ thống hàng loạt (Wifi, Ngôn ngữ, Múi giờ)
+        system_group = QGroupBox("4. Cấu hình Mạng & Hệ thống hàng loạt")
+        system_layout = QVBoxLayout(system_group)
+        system_layout.setContentsMargins(12, 15, 12, 12)
+        system_layout.setSpacing(8)
+
+        # Wifi Row 1: SSID, Password, Security
+        wifi_input_layout = QHBoxLayout()
+        self.txt_wifi_ssid = QLineEdit()
+        self.txt_wifi_ssid.setPlaceholderText("Tên WiFi (SSID)")
+        self.txt_wifi_ssid.setToolTip("Nhập SSID của WiFi")
+
+        self.txt_wifi_pass = QLineEdit()
+        self.txt_wifi_pass.setPlaceholderText("Mật khẩu WiFi")
+        self.txt_wifi_pass.setToolTip("Nhập mật khẩu WiFi (để trống nếu không mật khẩu)")
+
+        self.cbo_wifi_sec = QComboBox()
+        self.cbo_wifi_sec.addItems(["WPA2", "Open", "WPA3", "WEP"])
+        self.cbo_wifi_sec.setFixedWidth(80)
+
+        wifi_input_layout.addWidget(self.txt_wifi_ssid)
+        wifi_input_layout.addWidget(self.txt_wifi_pass)
+        wifi_input_layout.addWidget(self.cbo_wifi_sec)
+        system_layout.addLayout(wifi_input_layout)
+
+        # Wifi Row 2: Nút Kết nối Wifi
+        self.btn_connect_wifi = QPushButton("📶 Kết nối WiFi hàng loạt")
+        self.btn_connect_wifi.setObjectName("accentButton")
+        self.btn_connect_wifi.clicked.connect(self.farm_connect_wifi)
+        system_layout.addWidget(self.btn_connect_wifi)
+
+        # Đường kẻ phân cách
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.HLine)
+        divider.setStyleSheet("background-color: #23232a; max-height: 1px;")
+        system_layout.addWidget(divider)
+
+        # Hệ thống Row 1: Ngôn ngữ & Nút
+        lang_layout = QHBoxLayout()
+        self.cbo_language = QComboBox()
+        self.cbo_language.addItem("Tiếng Việt (vi-VN)", "vi-VN")
+        self.cbo_language.addItem("English (en-US)", "en-US")
+        self.cbo_language.addItem("English (en-GB)", "en-GB")
+        self.cbo_language.addItem("简体中文 (zh-CN)", "zh-CN")
+        self.cbo_language.addItem("한국어 (ko-KR)", "ko-KR")
+        self.cbo_language.addItem("日本語 (ja-JP)", "ja-JP")
+        self.cbo_language.addItem("ภาษาไทย (th-TH)", "th-TH")
+
+        self.btn_change_lang = QPushButton("🌐 Đổi Ngôn Ngữ")
+        self.btn_change_lang.clicked.connect(self.farm_change_language)
+        lang_layout.addWidget(self.cbo_language, 3)
+        lang_layout.addWidget(self.btn_change_lang, 2)
+        system_layout.addLayout(lang_layout)
+
+        # Hệ thống Row 2: Múi giờ & Nút
+        tz_layout = QHBoxLayout()
+        self.cbo_timezone = QComboBox()
+        self.cbo_timezone.addItem("Asia/Ho_Chi_Minh (GMT+7)", "Asia/Ho_Chi_Minh")
+        self.cbo_timezone.addItem("Asia/Singapore (GMT+8)", "Asia/Singapore")
+        self.cbo_timezone.addItem("Asia/Tokyo (GMT+9)", "Asia/Tokyo")
+        self.cbo_timezone.addItem("Asia/Seoul (GMT+9)", "Asia/Seoul")
+        self.cbo_timezone.addItem("Asia/Bangkok (GMT+7)", "Asia/Bangkok")
+        self.cbo_timezone.addItem("America/New_York (GMT-5)", "America/New_York")
+        self.cbo_timezone.addItem("America/Los_Angeles (GMT-8)", "America/Los_Angeles")
+        self.cbo_timezone.addItem("Europe/London (GMT+0)", "Europe/London")
+
+        self.btn_change_tz = QPushButton("🕒 Đổi Múi Giờ")
+        self.btn_change_tz.clicked.connect(self.farm_change_timezone)
+        tz_layout.addWidget(self.cbo_timezone, 3)
+        tz_layout.addWidget(self.btn_change_tz, 2)
+        system_layout.addLayout(tz_layout)
+
+        right_layout.addWidget(system_group)
+
+        right_scroll.setWidget(right_group)
+        body_layout.addWidget(right_scroll, 5)
         main_layout.addLayout(body_layout)
         
         # --- FOOTER / LOG CONSOLE AREA ---
@@ -273,6 +370,14 @@ class AndroidToolkitApp(QMainWindow):
     def log(self, text):
         t_str = time.strftime("[%H:%M:%S]")
         self.console_log.append(f"{t_str} {text}")
+        # Giới hạn số dòng log để tránh rò rỉ bộ nhớ (#21)
+        doc = self.console_log.document()
+        if doc.blockCount() > MAX_LOG_LINES:
+            cursor = self.console_log.textCursor()
+            cursor.movePosition(cursor.MoveOperation.Start)
+            cursor.movePosition(cursor.MoveOperation.Down, cursor.MoveMode.KeepAnchor, doc.blockCount() - MAX_LOG_LINES)
+            cursor.removeSelectedText()
+            cursor.deleteChar()  # Xóa newline thừa
 
     def toggle_demo_mode(self, state):
         enabled = (state == Qt.CheckState.Checked.value or state == True)
@@ -283,10 +388,6 @@ class AndroidToolkitApp(QMainWindow):
 
     def auto_map_python(self):
         """Tự động ánh xạ Python hiện tại vào PATH hệ thống và tạo file run.bat"""
-        import sys
-        import winreg
-        import ctypes
-        
         self.log("Bắt đầu tiến trình Tự động ánh xạ Python (Auto Map Python)...")
         
         try:
@@ -367,11 +468,12 @@ class AndroidToolkitApp(QMainWindow):
                 registry_msg = f"Lỗi khi ghi Registry: {reg_err}"
                 self.log("Gặp lỗi khi ghi vào Registry. Thử phương án dự phòng bằng lệnh setx...")
                 
-                # Phương án dự phòng bằng setx nếu lỗi Registry
+                # Phương án dự phòng bằng setx nếu lỗi Registry (không dùng shell=True để tránh injection)
                 try:
-                    import subprocess
                     for p in paths_to_add:
-                        subprocess.run(f'setx PATH "%PATH%;{p}"', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        current_env_path = os.environ.get("PATH", "")
+                        new_val = f"{current_env_path};{p}"
+                        subprocess.run(["setx", "PATH", new_val], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     registry_success = True
                     registry_msg = "Đã thử ánh xạ Python thông qua phương thức dự phòng 'setx'."
                 except Exception as setx_err:
@@ -458,6 +560,35 @@ pause
             self.devices_list = devices
             
             checked_ids = self.get_checked_farm_devices()
+            
+            # Cache model info để tránh gọi getprop mỗi lần refresh (#4, #17)
+            for dev in devices:
+                if dev["id"] not in self._model_cache or dev.get("model") != self._model_cache.get(dev["id"]):
+                    self._model_cache[dev["id"]] = dev.get("model", "Unknown Device")
+            
+            # Chỉ rebuild bảng nếu danh sách thiết bị thay đổi (#18)
+            current_ids = [dev["id"] for dev in devices]
+            table_ids = []
+            for r in range(self.farm_table.rowCount()):
+                id_item = self.farm_table.item(r, 2)
+                if id_item:
+                    table_ids.append(id_item.text())
+            
+            # So sánh: nếu danh sách không đổi, chỉ update trạng thái
+            if current_ids == table_ids and len(devices) > 0:
+                for idx, dev in enumerate(devices):
+                    state_item = self.farm_table.item(idx, 3)
+                    if state_item and state_item.text() != dev["state"].upper():
+                        state_item.setText(dev["state"].upper())
+                        if dev["state"] == "device":
+                            state_item.setForeground(QColor("#00ff7f"))
+                        elif dev["state"] in ["fastboot", "bootloader"]:
+                            state_item.setForeground(QColor("#ffaa00"))
+                        else:
+                            state_item.setForeground(QColor("#00f0ff"))
+                return
+            
+            # Rebuild toàn bộ bảng nếu danh sách thay đổi
             self.farm_table.setRowCount(0)
             
             if not devices:
@@ -521,6 +652,15 @@ pause
             QMessageBox.warning(self, "Cảnh báo", "Vui lòng chọn tối thiểu 1 thiết bị để xem màn hình.")
             return
 
+        # Giới hạn số tiến trình Scrcpy (#3)
+        if len(device_ids) > MAX_SCRCPY_INSTANCES:
+            QMessageBox.warning(
+                self, "Cảnh báo",
+                f"Số thiết bị đã chọn ({len(device_ids)}) vượt quá giới hạn {MAX_SCRCPY_INSTANCES} phiên Scrcpy đồng thời.\n"
+                f"Vui lòng bỏ chọn bớt thiết bị."
+            )
+            return
+
         # Đọc kích thước cửa sổ từ Combobox
         size_text = self.cbo_scrcpy_size.currentText()
         w, h = None, None
@@ -536,47 +676,43 @@ pause
             res, rc = self.adb.launch_scrcpy(device_id, w=w, h=h)
             self.log(f"[{device_id}] {res}")
 
-    def farm_arrange_windows(self):
-        """Tự động xếp lưới toàn bộ cửa sổ Scrcpy đang mở bằng Windows API."""
-        import ctypes
+    def _find_scrcpy_windows(self):
+        """Tìm tất cả cửa sổ Scrcpy đang mở bằng Windows API."""
+        from ctypes import wintypes
         
-        # Danh sách lưu các HWND
         hwnds = []
-        
-        # Định nghĩa kiểu dữ liệu callback
-        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
         
         def enum_windows_callback(hwnd, lParam):
             if ctypes.windll.user32.IsWindowVisible(hwnd):
-                # 1. Lấy Class Name
                 class_buff = ctypes.create_unicode_buffer(256)
                 ctypes.windll.user32.GetClassNameW(hwnd, class_buff, 256)
                 class_name = class_buff.value
                 
-                # 2. Lấy tiêu đề cửa sổ
                 length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
                 if length > 0:
                     buff = ctypes.create_unicode_buffer(length + 1)
                     ctypes.windll.user32.GetWindowTextW(hwnd, buff, length + 1)
                     title = buff.value
                     
-                    # Cửa sổ Scrcpy có class name là "SDL_app" và tiêu đề chứa "scrcpy" hoặc ID thiết bị
                     is_scrcpy_class = (class_name == "SDL_app")
                     is_scrcpy_title = "scrcpy" in title.lower() or any(dev["id"] in title for dev in self.devices_list)
                     
                     if is_scrcpy_class and is_scrcpy_title:
                         hwnds.append(hwnd)
             return True
-            
+        
         try:
-            # Tạo và giữ chặt tham chiếu của callback để tránh bị Garbage Collector thu hồi gây crash app
             self.enum_callback = EnumWindowsProc(enum_windows_callback)
-            
-            # Gọi EnumWindows
             ctypes.windll.user32.EnumWindows(self.enum_callback, 0)
         except Exception as e:
             self.log(f"Lỗi khi quét cửa sổ hệ thống: {e}")
-            return
+        
+        return hwnds
+
+    def farm_arrange_windows(self):
+        """Tự động xếp lưới toàn bộ cửa sổ Scrcpy đang mở bằng Windows API."""
+        hwnds = self._find_scrcpy_windows()
         
         if not hwnds:
             self.log("Không tìm thấy cửa sổ Scrcpy nào đang hoạt động trên màn hình.")
@@ -585,44 +721,113 @@ pause
 
         self.log(f"Đã phát hiện {len(hwnds)} cửa sổ Scrcpy đang chạy. Bắt đầu xếp lưới...")
 
-        # Lấy kích thước màn hình
+        # Lấy kích thước màn hình (trừ taskbar)
         screen = QApplication.primaryScreen()
         if screen:
-            screen_geo = screen.geometry()
-            screen_w = screen_geo.width()
-            screen_h = screen_geo.height()
+            available_geo = screen.availableGeometry()
+            screen_w = available_geo.width()
+            screen_h = available_geo.height()
         else:
-            screen_w, screen_h = 1920, 1080
+            screen_w, screen_h = 1920, 1000
 
-        # Lấy kích thước cửa sổ đã chọn để định vị
-        size_text = self.cbo_scrcpy_size.currentText()
-        w, h = 320, 640
-        if "Trung bình" in size_text:
-            w, h = 320, 640
-        elif "Nhỏ" in size_text:
-            w, h = 240, 480
-        elif "Lớn" in size_text:
-            w, h = 400, 800
+        # Tính toán số cột tối ưu dựa trên số cửa sổ
+        num_windows = len(hwnds)
+        
+        # Tính số cột dựa trên tỷ lệ màn hình và số cửa sổ
+        # Scrcpy giữ tỷ lệ 9:16 (portrait) hoặc 16:9 (landscape)
+        # Giả sử tỷ lệ portrait 9:19.5 (điện thoại hiện đại)
+        aspect_ratio = 9 / 19.5
+        
+        # Tính số cột tối ưu để lấp đầy màn hình
+        if num_windows <= 2:
+            cols = num_windows
+        elif num_windows <= 4:
+            cols = 2
+        elif num_windows <= 6:
+            cols = 3
+        elif num_windows <= 9:
+            cols = 3
+        elif num_windows <= 12:
+            cols = 4
+        else:
+            cols = 5
+        
+        rows = (num_windows + cols - 1) // cols
+        
+        # Tính kích thước cửa sổ dựa trên không gian có sẵn
+        padding = 10
+        gap = 5
+        
+        available_w = screen_w - (padding * 2) - (gap * (cols - 1))
+        available_h = screen_h - (padding * 2) - (gap * (rows - 1))
+        
+        cell_w = available_w // cols
+        cell_h = available_h // rows
+        
+        # Tính kích thước cửa sổ giữ tỷ lệ trong ô
+        if cell_w / cell_h > aspect_ratio:
+            # Ô rộng hơn tỷ lệ -> giới hạn theo chiều cao
+            win_h = cell_h
+            win_w = int(cell_h * aspect_ratio)
+        else:
+            # Ô cao hơn tỷ lệ -> giới hạn theo chiều rộng
+            win_w = cell_w
+            win_h = int(cell_w / aspect_ratio)
+        
+        self.log(f"Xếp lưới {cols} cột x {rows} hàng, kích thước mỗi cửa sổ: {win_w}x{win_h}")
 
-        start_x, start_y = 60, 60
-        gap_x, gap_y = 15, 45
-        curr_x, curr_y = start_x, start_y
+        for idx, hwnd in enumerate(hwnds):
+            row = idx // cols
+            col = idx % cols
+            
+            # Tính vị trí căn giữa trong ô
+            cell_x = padding + col * (cell_w + gap)
+            cell_y = padding + row * (cell_h + gap)
+            
+            # Căn giữa cửa sổ trong ô
+            x = cell_x + (cell_w - win_w) // 2
+            y = cell_y + (cell_h - win_h) // 2
+            
+            # Di chuyển cửa sổ (chỉ thay đổi vị trí, không ép kích thước)
+            # SWP_NOSIZE = 0x0001 (giữ nguyên kích thước)
+            # SWP_NOZORDER = 0x0004
+            # SWP_SHOWWINDOW = 0x0040
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, 0, 0, 0x0001 | 0x0004 | 0x0040)
+            self.log(f"Đã di chuyển cửa sổ {idx+1}/{num_windows} đến vị trí: ({x}, {y})")
 
+        self.log("🎯 Đã sắp xếp lưới thành công toàn bộ cửa sổ Scrcpy trên màn hình!")
+
+    def farm_close_all_scrcpy(self):
+        """Đóng tất cả cửa sổ Scrcpy đang mở."""
+        hwnds = self._find_scrcpy_windows()
+        
+        if not hwnds:
+            self.log("Không tìm thấy cửa sổ Scrcpy nào để đóng.")
+            QMessageBox.information(self, "Thông tin", "Không có cửa sổ Scrcpy nào đang mở.")
+            return
+        
+        confirm = QMessageBox.question(
+            self,
+            "Xác nhận",
+            f"Bạn có chắc chắn muốn đóng tất cả {len(hwnds)} cửa sổ Scrcpy đang mở?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if confirm == QMessageBox.StandardButton.No:
+            return
+        
+        self.log(f"Đang đóng {len(hwnds)} cửa sổ Scrcpy...")
+        
+        # WM_CLOSE = 0x0010
+        closed_count = 0
         for hwnd in hwnds:
-            # SetWindowPos(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags)
-            # 0x0004 = SWP_NOZORDER (giữ nguyên thứ tự Z)
-            # 0x0040 = SWP_SHOWWINDOW (hiển thị cửa sổ)
-            
-            # Đưa cửa sổ lên phía trên và định vị lại
-            ctypes.windll.user32.SetWindowPos(hwnd, 0, curr_x, curr_y, w, h, 0x0004 | 0x0040)
-            self.log(f"Đã di chuyển cửa sổ HWND {hwnd} đến vị trí: x={curr_x}, y={curr_y}")
-            
-            curr_x += w + gap_x
-            if curr_x + w > screen_w - 100:
-                curr_x = start_x
-                curr_y += h + gap_y
-
-        self.log("🎯 Đã sắp xếp xếp lưới thành công toàn bộ cửa sổ Scrcpy trên màn hình!")
+            try:
+                ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)
+                closed_count += 1
+            except Exception as e:
+                self.log(f"Lỗi khi đóng cửa sổ HWND {hwnd}: {e}")
+        
+        self.log(f"✅ Đã gửi lệnh đóng {closed_count}/{len(hwnds)} cửa sổ Scrcpy.")
 
     def on_apks_selected(self, paths):
         self.apk_list.add_apks(paths)
@@ -632,6 +837,11 @@ pause
         device_ids = self.get_checked_farm_devices()
         if not device_ids:
             QMessageBox.warning(self, "Cảnh báo", "Vui lòng tích chọn tối thiểu 1 thiết bị để cài đặt.")
+            return
+
+        # Kiểm tra worker đang chạy (#6)
+        if self.active_worker and self.active_worker.isRunning():
+            QMessageBox.warning(self, "Cảnh báo", "Đang có tác vụ khác đang chạy. Vui lòng đợi hoàn tất.")
             return
 
         apk_paths = self.apk_list.get_all_paths()
@@ -678,6 +888,11 @@ pause
             QMessageBox.warning(self, "Cảnh báo", "Vui lòng chọn tối thiểu 1 thiết bị để thực hiện.")
             return
 
+        # Kiểm tra worker đang chạy (#6)
+        if self.active_worker and self.active_worker.isRunning():
+            QMessageBox.warning(self, "Cảnh báo", "Đang có tác vụ khác đang chạy. Vui lòng đợi hoàn tất.")
+            return
+
         mode_text = {
             "system": "Khởi động lại (Restart)",
             "recovery": "Vào TWRP Recovery",
@@ -714,6 +929,174 @@ pause
         self.active_worker = None
         # Đợi 1.5 giây rồi quét lại trạng thái thiết bị
         QTimer.singleShot(1500, self.refresh_devices)
+
+    def closeEvent(self, event):
+        """Cleanup worker thread khi đóng ứng dụng (#5)."""
+        self.refresh_timer.stop()
+        if self.active_worker and self.active_worker.isRunning():
+            self.active_worker.cancel()
+            self.active_worker.wait(3000)  # Đợi tối đa 3 giây
+        event.accept()
+
+    def farm_connect_wifi(self):
+        device_ids = self.get_checked_farm_devices()
+        if not device_ids:
+            QMessageBox.warning(self, "Cảnh báo", "Vui lòng chọn tối thiểu 1 thiết bị để kết nối WiFi.")
+            return
+
+        ssid = self.txt_wifi_ssid.text().strip()
+        password = self.txt_wifi_pass.text().strip()
+        security = self.cbo_wifi_sec.currentText()
+
+        if not ssid:
+            QMessageBox.warning(self, "Cảnh báo", "Vui lòng nhập tên WiFi (SSID).")
+            return
+
+        self.btn_connect_wifi.setEnabled(False)
+        self.install_progress.setVisible(True)
+        self.install_progress.setValue(0)
+
+        self.log(f"Khởi động kết nối WiFi '{ssid}' hàng loạt lên {len(device_ids)} thiết bị...")
+
+        self.active_worker = ADBTaskWorker(
+            self.adb,
+            "wifi_bulk",
+            {
+                "device_ids": device_ids,
+                "ssid": ssid,
+                "password": password,
+                "security": security
+            }
+        )
+        self.active_worker.progress.connect(self.on_task_progress)
+        self.active_worker.finished.connect(self.on_wifi_bulk_finished)
+        self.active_worker.start()
+
+    def on_wifi_bulk_finished(self, success, msg):
+        self.btn_connect_wifi.setEnabled(True)
+        self.install_progress.setVisible(False)
+        if success:
+            QMessageBox.information(self, "Thành công", msg)
+        else:
+            QMessageBox.critical(self, "Lỗi kết nối", msg)
+        self.active_worker = None
+
+    def farm_change_language(self):
+        device_ids = self.get_checked_farm_devices()
+        if not device_ids:
+            QMessageBox.warning(self, "Cảnh báo", "Vui lòng chọn tối thiểu 1 thiết bị để đổi ngôn ngữ.")
+            return
+
+        index = self.cbo_language.currentIndex()
+        locale = self.cbo_language.itemData(index)
+        lang_text = self.cbo_language.currentText()
+
+        if not locale:
+            lang_map = {
+                "Tiếng Việt (vi-VN)": "vi-VN",
+                "English (en-US)": "en-US",
+                "English (en-GB)": "en-GB",
+                "简体中文 (zh-CN)": "zh-CN",
+                "한국어 (ko-KR)": "ko-KR",
+                "日本語 (ja-JP)": "ja-JP",
+                "ภาษาไทย (th-TH)": "th-TH"
+            }
+            locale = lang_map.get(lang_text, "vi-VN")
+
+        confirm = QMessageBox.question(
+            self,
+            "Xác nhận",
+            f"Bạn có chắc chắn muốn đổi ngôn ngữ sang '{lang_text}' cho {len(device_ids)} thiết bị?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if confirm == QMessageBox.StandardButton.No:
+            return
+
+        self.btn_change_lang.setEnabled(False)
+        self.install_progress.setVisible(True)
+        self.install_progress.setValue(0)
+
+        self.log(f"Khởi động đổi ngôn ngữ sang '{lang_text}' hàng loạt trên {len(device_ids)} thiết bị...")
+
+        self.active_worker = ADBTaskWorker(
+            self.adb,
+            "change_language_bulk",
+            {
+                "device_ids": device_ids,
+                "locale": locale
+            }
+        )
+        self.active_worker.progress.connect(self.on_task_progress)
+        self.active_worker.finished.connect(self.on_change_language_finished)
+        self.active_worker.start()
+
+    def on_change_language_finished(self, success, msg):
+        self.btn_change_lang.setEnabled(True)
+        self.install_progress.setVisible(False)
+        if success:
+            QMessageBox.information(self, "Thành công", msg)
+        else:
+            QMessageBox.critical(self, "Lỗi đổi ngôn ngữ", msg)
+        self.active_worker = None
+
+    def farm_change_timezone(self):
+        device_ids = self.get_checked_farm_devices()
+        if not device_ids:
+            QMessageBox.warning(self, "Cảnh báo", "Vui lòng chọn tối thiểu 1 thiết bị để đổi múi giờ.")
+            return
+
+        index = self.cbo_timezone.currentIndex()
+        timezone = self.cbo_timezone.itemData(index)
+        tz_text = self.cbo_timezone.currentText()
+
+        if not timezone:
+            tz_map = {
+                "Asia/Ho_Chi_Minh (GMT+7)": "Asia/Ho_Chi_Minh",
+                "Asia/Singapore (GMT+8)": "Asia/Singapore",
+                "Asia/Tokyo (GMT+9)": "Asia/Tokyo",
+                "Asia/Seoul (GMT+9)": "Asia/Seoul",
+                "Asia/Bangkok (GMT+7)": "Asia/Bangkok",
+                "America/New_York (GMT-5)": "America/New_York",
+                "America/Los_Angeles (GMT-8)": "America/Los_Angeles",
+                "Europe/London (GMT+0)": "Europe/London"
+            }
+            timezone = tz_map.get(tz_text, "Asia/Ho_Chi_Minh")
+
+        confirm = QMessageBox.question(
+            self,
+            "Xác nhận",
+            f"Bạn có chắc chắn muốn đổi múi giờ sang '{tz_text}' cho {len(device_ids)} thiết bị?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if confirm == QMessageBox.StandardButton.No:
+            return
+
+        self.btn_change_tz.setEnabled(False)
+        self.install_progress.setVisible(True)
+        self.install_progress.setValue(0)
+
+        self.log(f"Khởi động cấu hình múi giờ sang '{tz_text}' hàng loạt trên {len(device_ids)} thiết bị...")
+
+        self.active_worker = ADBTaskWorker(
+            self.adb,
+            "change_timezone_bulk",
+            {
+                "device_ids": device_ids,
+                "timezone": timezone
+            }
+        )
+        self.active_worker.progress.connect(self.on_task_progress)
+        self.active_worker.finished.connect(self.on_change_timezone_finished)
+        self.active_worker.start()
+
+    def on_change_timezone_finished(self, success, msg):
+        self.btn_change_tz.setEnabled(True)
+        self.install_progress.setVisible(False)
+        if success:
+            QMessageBox.information(self, "Thành công", msg)
+        else:
+            QMessageBox.critical(self, "Lỗi cấu hình múi giờ", msg)
+        self.active_worker = None
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

@@ -129,8 +129,15 @@ class APKListWidget(QFrame):
             if path in self.apks_map:
                 continue
             
+            # Validate file tồn tại và có kích thước > 0 (#12)
+            if not os.path.isfile(path):
+                continue
+            file_size = os.path.getsize(path)
+            if file_size == 0:
+                continue
+            
             filename = os.path.basename(path)
-            size_mb = os.path.getsize(path) / (1024 * 1024)
+            size_mb = file_size / (1024 * 1024)
             
             item = QListWidgetItem()
             self.list_widget.addItem(item)

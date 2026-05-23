@@ -1,10 +1,14 @@
 import os
 import subprocess
 import shutil
+import shlex
 import time
 import re
 import tempfile
 from PyQt6.QtCore import QThread, pyqtSignal
+
+# Timeout mặc định cho mỗi lệnh ADB/Fastboot (giây)
+DEFAULT_CMD_TIMEOUT = 30
 
 class ADBWrapper:
     def __init__(self, custom_path=None):
@@ -58,13 +62,16 @@ class ADBWrapper:
                 if fastboot_path:
                     self.fastboot_bin = fastboot_path
 
-    def run_command(self, cmd_args, is_fastboot=False):
+    def run_command(self, cmd_args, is_fastboot=False, timeout=None):
         """Chạy một lệnh hệ thống và trả về stdout, stderr, returncode."""
         if self.demo_mode:
             return "", "", 0
 
         binary = self.fastboot_bin if is_fastboot else self.adb_bin
         full_cmd = [binary] + cmd_args
+        
+        if timeout is None:
+            timeout = DEFAULT_CMD_TIMEOUT
         
         try:
             # Chạy ẩn cửa sổ console trên Windows
@@ -83,8 +90,12 @@ class ADBWrapper:
                 encoding="utf-8",
                 errors="ignore"
             )
-            stdout, stderr = process.communicate()
+            stdout, stderr = process.communicate(timeout=timeout)
             return stdout, stderr, process.returncode
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            return "", f"Lệnh bị timeout sau {timeout} giây", -2
         except Exception as e:
             return "", str(e), -1
 
@@ -118,7 +129,7 @@ class ADBWrapper:
                     devices.append({"id": dev_id, "state": state, "type": "adb"})
 
         # 2. Quét thiết bị Fastboot
-        stdout, _, rc = self.run_command(["devices"], is_fastboot=True)
+        stdout, stderr, rc = self.run_command(["devices"], is_fastboot=True)
         if rc == 0:
             lines = stdout.strip().split("\n")
             for line in lines:
@@ -129,6 +140,9 @@ class ADBWrapper:
                     dev_id = parts[0]
                     state = parts[1] # 'fastboot', 'fastbootd'
                     devices.append({"id": dev_id, "state": state, "type": "fastboot"})
+        elif rc != -2:
+            # Log lỗi fastboot (trừ timeout vì có thể không có fastboot)
+            pass  # Fastboot có thể không khả dụng, bỏ qua
 
         # Thêm thông tin Model cho thiết bị
         for dev in devices:
@@ -357,6 +371,12 @@ class ADBTaskWorker(QThread):
                 self.run_sideload()
             elif self.task_type == "extract_apk":
                 self.run_extract_apk()
+            elif self.task_type == "wifi_bulk":
+                self.run_wifi_bulk()
+            elif self.task_type == "change_language_bulk":
+                self.run_change_language_bulk()
+            elif self.task_type == "change_timezone_bulk":
+                self.run_change_timezone_bulk()
             else:
                 self.finished.emit(False, "Tác vụ không xác định.")
         except Exception as e:
@@ -605,7 +625,7 @@ class ADBTaskWorker(QThread):
                 self.progress.emit(pct, f"[{device_id}] Trả về: (Chế độ Demo) Lệnh đã chạy thành công.")
                 continue
 
-            cmd = ["-s", device_id, "shell"] + shell_cmd.split()
+            cmd = ["-s", device_id, "shell"] + shlex.split(shell_cmd)
             stdout, stderr, rc = self.wrapper.run_command(cmd)
             
             log_msg = f"[{device_id}] Kết quả:\n"
@@ -688,3 +708,137 @@ class ADBTaskWorker(QThread):
 
         import json
         self.finished.emit(True, json.dumps(screenshot_paths))
+
+    def run_wifi_bulk(self):
+        device_ids = self.args.get("device_ids", [])
+        ssid = self.args.get("ssid")
+        password = self.args.get("password", "")
+        security = self.args.get("security", "wpa2").lower()
+
+        if not device_ids:
+            self.finished.emit(False, "Không có thiết bị nào được chọn.")
+            return
+        if not ssid:
+            self.finished.emit(False, "Tên WiFi (SSID) trống.")
+            return
+
+        total = len(device_ids)
+        for idx, device_id in enumerate(device_ids):
+            if self._is_cancelled:
+                self.finished.emit(False, "Bị hủy.")
+                return
+
+            pct = int((idx / total) * 100)
+            self.progress.emit(pct, f"[{device_id}] Đang kết nối WiFi '{ssid}'...")
+
+            if self.wrapper.demo_mode:
+                time.sleep(0.6)
+                self.progress.emit(pct, f"✅ [{device_id}] Kết nối thành công WiFi '{ssid}' (Mô phỏng)")
+                continue
+
+            # 1. Kích hoạt WiFi
+            self.wrapper.run_command(["-s", device_id, "shell", "svc", "wifi", "enable"])
+            self.wrapper.run_command(["-s", device_id, "shell", "cmd", "wifi", "set-wifi-enabled", "enabled"])
+            time.sleep(1.0) # Đợi 1 giây để WiFi khởi động
+
+            # 2. Kết nối WiFi
+            cmd = ["-s", device_id, "shell", "cmd", "wifi", "connect-to-network", ssid, security]
+            if password and security != "open":
+                cmd.append(password)
+
+            stdout, stderr, rc = self.wrapper.run_command(cmd)
+            if rc != 0 or "fail" in stdout.lower() or "error" in stdout.lower() or "error" in stderr.lower():
+                err_msg = stderr or stdout or "Không rõ nguyên nhân"
+                self.progress.emit(pct, f"❌ [{device_id}] Kết nối WiFi thất bại: {err_msg.strip()}")
+            else:
+                self.progress.emit(pct, f"✅ [{device_id}] Kết nối thành công WiFi '{ssid}'")
+
+        self.progress.emit(100, "Đã hoàn tất kết nối WiFi hàng loạt!")
+        self.finished.emit(True, "Kết nối WiFi hàng loạt hoàn tất!")
+
+    def run_change_language_bulk(self):
+        device_ids = self.args.get("device_ids", [])
+        locale = self.args.get("locale")
+
+        if not device_ids:
+            self.finished.emit(False, "Không có thiết bị nào được chọn.")
+            return
+        if not locale:
+            self.finished.emit(False, "Mã ngôn ngữ (locale) trống.")
+            return
+
+        lang = "vi"
+        country = "VN"
+        if "-" in locale:
+            parts = locale.split("-")
+            lang = parts[0]
+            country = parts[1]
+        elif "_" in locale:
+            parts = locale.split("_")
+            lang = parts[0]
+            country = parts[1]
+        else:
+            lang = locale
+
+        total = len(device_ids)
+        for idx, device_id in enumerate(device_ids):
+            if self._is_cancelled:
+                self.finished.emit(False, "Bị hủy.")
+                return
+
+            pct = int((idx / total) * 100)
+            self.progress.emit(pct, f"[{device_id}] Đang đổi ngôn ngữ sang '{locale}'...")
+
+            if self.wrapper.demo_mode:
+                time.sleep(0.5)
+                self.progress.emit(pct, f"✅ [{device_id}] Đổi ngôn ngữ thành công sang '{locale}' (Mô phỏng)")
+                continue
+
+            self.wrapper.run_command(["-s", device_id, "shell", "settings", "put", "system", "system_locales", locale])
+            self.wrapper.run_command(["-s", device_id, "shell", "settings", "put", "secure", "system_locales", locale])
+            self.wrapper.run_command(["-s", device_id, "shell", "setprop", "persist.sys.locale", locale])
+            self.wrapper.run_command(["-s", device_id, "shell", "setprop", "persist.sys.language", lang])
+            self.wrapper.run_command(["-s", device_id, "shell", "setprop", "persist.sys.country", country])
+            self.wrapper.run_command(["-s", device_id, "shell", "am", "broadcast", "-a", "android.intent.action.LOCALE_CHANGED"])
+
+            self.progress.emit(pct, f"✅ [{device_id}] Đổi ngôn ngữ thành công sang '{locale}'")
+
+        self.progress.emit(100, "Đã hoàn tất đổi ngôn ngữ hàng loạt!")
+        self.finished.emit(True, "Đổi ngôn ngữ hàng loạt hoàn tất!")
+
+    def run_change_timezone_bulk(self):
+        device_ids = self.args.get("device_ids", [])
+        timezone = self.args.get("timezone")
+
+        if not device_ids:
+            self.finished.emit(False, "Không có thiết bị nào được chọn.")
+            return
+        if not timezone:
+            self.finished.emit(False, "Múi giờ (timezone) trống.")
+            return
+
+        total = len(device_ids)
+        for idx, device_id in enumerate(device_ids):
+            if self._is_cancelled:
+                self.finished.emit(False, "Bị hủy.")
+                return
+
+            pct = int((idx / total) * 100)
+            self.progress.emit(pct, f"[{device_id}] Đang cấu hình múi giờ sang '{timezone}'...")
+
+            if self.wrapper.demo_mode:
+                time.sleep(0.5)
+                self.progress.emit(pct, f"✅ [{device_id}] Đổi múi giờ thành công sang '{timezone}' (Mô phỏng)")
+                continue
+
+            # 1. Tắt tự động cập nhật múi giờ
+            self.wrapper.run_command(["-s", device_id, "shell", "settings", "put", "global", "auto_time_zone", "0"])
+            
+            # 2. Đặt múi giờ mới
+            self.wrapper.run_command(["-s", device_id, "shell", "settings", "put", "global", "timezone", timezone])
+            self.wrapper.run_command(["-s", device_id, "shell", "setprop", "persist.sys.timezone", timezone])
+
+            self.progress.emit(pct, f"✅ [{device_id}] Đã cấu hình múi giờ '{timezone}'")
+
+        self.progress.emit(100, "Đã hoàn tất cấu hình múi giờ hàng loạt!")
+        self.finished.emit(True, "Đổi múi giờ hàng loạt hoàn tất!")
