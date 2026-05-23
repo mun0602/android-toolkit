@@ -568,8 +568,15 @@ pause
                         hwnds.append(hwnd)
             return True
             
-        # Gọi EnumWindows
-        ctypes.windll.user32.EnumWindows(EnumWindowsProc(enum_windows_callback), 0)
+        try:
+            # Tạo và giữ chặt tham chiếu của callback để tránh bị Garbage Collector thu hồi gây crash app
+            self.enum_callback = EnumWindowsProc(enum_windows_callback)
+            
+            # Gọi EnumWindows
+            ctypes.windll.user32.EnumWindows(self.enum_callback, 0)
+        except Exception as e:
+            self.log(f"Lỗi khi quét cửa sổ hệ thống: {e}")
+            return
         
         if not hwnds:
             self.log("Không tìm thấy cửa sổ Scrcpy nào đang hoạt động trên màn hình.")
