@@ -307,16 +307,6 @@ QPushButton#accentButton:pressed {
     background-color: #008f95;
 }
 
-/* QScrollArea Styling - Đảm bảo trong suốt và mượt mà */
-QScrollArea {
-    background-color: transparent;
-    border: none;
-}
-
-QScrollArea > QWidget > QWidget {
-    background-color: transparent;
-}
-
 /* QMessageBox Styling - Đảm bảo chữ đối lập nền dễ nhìn */
 QMessageBox {
     background-color: #141418;

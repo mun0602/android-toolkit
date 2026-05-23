@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QLabel, QGroupBox, QLineEdit, QComboBox, 
     QTableWidget, QTableWidgetItem, QProgressBar, QTextEdit, 
-    QCheckBox, QHeaderView, QMessageBox, QScrollArea
+    QCheckBox, QHeaderView, QMessageBox
 )
 from PyQt6.QtCore import Qt, QTimer, QSize
 from PyQt6.QtGui import QColor, QPixmap
@@ -227,15 +227,7 @@ class AndroidToolkitApp(QMainWindow):
         
         right_layout.addWidget(reboot_group)
         
-        # Cấu hình Scroll Area cho cột phải để đảm bảo tính Responsive cực cao khi co giãn màn hình dọc
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll_area.setWidget(right_group)
-        
-        body_layout.addWidget(scroll_area, 5)
+        body_layout.addWidget(right_group, 5)
         main_layout.addLayout(body_layout)
         
         # --- FOOTER / LOG CONSOLE AREA ---
