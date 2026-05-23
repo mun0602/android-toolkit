@@ -284,8 +284,8 @@ class ADBWrapper:
                 if os.path.exists(test_scrcpy):
                     scrcpy_bin = test_scrcpy
 
-        # Xây dựng các đối số lệnh
-        args = [scrcpy_bin, "-s", device_id, f"--window-title=Scrcpy - {device_id}"]
+        # Xây dựng các đối số lệnh - dùng --serial= theo tài liệu chính thức Git Scrcpy
+        args = [scrcpy_bin, f"--serial={device_id}", f"--window-title=Scrcpy - {device_id}"]
         
         # Tích hợp các tham số tối ưu hóa hiệu năng cao từ Git Scrcpy để chạy nhiều thiết bị mượt mà không bị đơ
         args.append("--no-audio")          # Tắt truyền âm thanh (giảm cực lớn tải CPU & băng thông USB)
@@ -305,8 +305,18 @@ class ADBWrapper:
             args.append(f"--window-height={h}")
 
         try:
-            # Khởi chạy scrcpy độc lập dưới nền (không chặn luồng chính)
-            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Khởi chạy scrcpy trong tiến trình hoàn toàn độc lập (CREATE_NEW_PROCESS_GROUP)
+            # Đây là điều kiện bắt buộc để mỗi thiết bị có cửa sổ riêng biệt, không bị gộp vào 1 tiến trình
+            creation_flags = 0
+            if os.name == "nt":
+                creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creation_flags
+            )
+            time.sleep(0.6)  # Dừng 600ms giữa mỗi lần khởi chạy để tránh ADB bị quá tải
             return f"Đã gửi yêu cầu mở màn hình gương Scrcpy cho thiết bị {device_id}.", 0
         except Exception as e:
             return f"Lỗi khởi chạy Scrcpy: {str(e)}. Hãy chắc chắn Scrcpy đã được cài đặt.", -1
