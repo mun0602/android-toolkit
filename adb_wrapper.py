@@ -287,6 +287,13 @@ class ADBWrapper:
         # Xây dựng các đối số lệnh
         args = [scrcpy_bin, "-s", device_id, f"--window-title=Scrcpy - {device_id}"]
         
+        # Tích hợp các tham số tối ưu hóa hiệu năng cao từ Git Scrcpy để chạy nhiều thiết bị mượt mà không bị đơ
+        args.append("--no-audio")          # Tắt truyền âm thanh (giảm cực lớn tải CPU & băng thông USB)
+        args.append("--max-fps=30")        # Giới hạn 30 FPS (tiết kiệm 50% tải xử lý hình ảnh của GPU)
+        args.append("--max-size=1024")     # Giới hạn độ phân giải luồng video về tối đa 1024px (giải mã cực nhẹ)
+        args.append("--video-bit-rate=2M") # Giới hạn bitrate 2Mbps (tránh nghẽn băng thông Hub USB khi chạy farm)
+        args.append("--video-codec=h264")  # Bộ codec H.264 ổn định và giải mã phần cứng tương thích tốt nhất
+        
         # Bổ sung các tùy chọn vị trí và kích thước nếu có
         if x is not None:
             args.append(f"--window-x={x}")
